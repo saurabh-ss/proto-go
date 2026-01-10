@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"sort"
 	"syscall"
 	"time"
 
@@ -67,82 +68,96 @@ func main() {
 	}
 }
 
+type priceEntry struct {
+	timestamp int32
+	price     int32
+}
+
 func handleConnection(conn net.Conn) {
 	log.Println("New connection from", conn.RemoteAddr())
 	defer conn.Close()
 	defer log.Println("Connection closed from", conn.RemoteAddr())
 
-	// Set connection timeout
-	conn.SetDeadline(time.Now().Add(30 * time.Second))
-
-	// Use buffered reader to handle line-delimited messages
 	reader := bufio.NewReader(conn)
 	prices := make(map[int32]int32)
+	sortedPrices := make([]priceEntry, 0)
 
-	mLen := 9
-	buf := make([]byte, mLen)
+	buf := make([]byte, 9)
 
 	for {
 		// Reset deadline for each operation
 		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
 
 		_, err := io.ReadFull(reader, buf)
-		log.Println("Read", len(buf), "bytes", buf)
 		if err != nil {
-			if err == io.EOF {
-				log.Println("Connection closed by client")
-			} else {
+			if err != io.EOF {
 				log.Println("Read error:", err)
 			}
 			return
 		}
 
-		if buf[0] != 'I' && buf[0] != 'Q' {
-			log.Println("Invalid message type", buf[0])
-			conn.Close()
-			return
-		}
-
-		if buf[0] == 'I' {
-			// Example [73 0 0 48 57 0 0 0 101]
+		switch buf[0] {
+		case 'I':
 			ts := int32(binary.BigEndian.Uint32(buf[1:5]))
 			price := int32(binary.BigEndian.Uint32(buf[5:9]))
-			_, exists := prices[ts]
-			if exists {
+
+			if _, exists := prices[ts]; exists {
 				log.Println("Duplicate timestamp", ts)
-				conn.Close()
 				return
 			}
-			prices[ts] = price
-			log.Println("Insert", ts, price)
-		}
 
-		if buf[0] == 'Q' {
+			prices[ts] = price
+
+			// Insert into sorted slice using binary search
+			idx := sort.Search(len(sortedPrices), func(i int) bool {
+				return sortedPrices[i].timestamp >= ts
+			})
+
+			// Insert at the correct position
+			sortedPrices = append(sortedPrices, priceEntry{})
+			copy(sortedPrices[idx+1:], sortedPrices[idx:])
+			sortedPrices[idx] = priceEntry{timestamp: ts, price: price}
+
+			log.Println("Insert", ts, price)
+
+		case 'Q':
 			tsMin := int32(binary.BigEndian.Uint32(buf[1:5]))
 			tsMax := int32(binary.BigEndian.Uint32(buf[5:9]))
 			log.Println("Query", tsMin, tsMax)
-			sum := 0
-			count := 0
-			for ts, price := range prices {
-				if ts >= tsMin && ts <= tsMax {
-					sum += int(price)
-					count++
-				}
+
+			// Binary search for range boundaries
+			startIdx := sort.Search(len(sortedPrices), func(i int) bool {
+				return sortedPrices[i].timestamp >= tsMin
+			})
+
+			endIdx := sort.Search(len(sortedPrices), func(i int) bool {
+				return sortedPrices[i].timestamp > tsMax
+			})
+
+			var sum int64
+			count := endIdx - startIdx
+
+			for i := startIdx; i < endIdx; i++ {
+				sum += int64(sortedPrices[i].price)
 			}
-			var mean int32
-			mean = 0
+
+			mean := int32(0)
 			if count > 0 {
-				mean = int32(sum / count)
+				mean = int32(sum / int64(count))
 			}
+
 			log.Println("Mean", mean, "from sum", sum, "count", count)
+
 			response := make([]byte, 4)
 			binary.BigEndian.PutUint32(response, uint32(mean))
-			_, err := conn.Write(response)
-			if err != nil {
+			if _, err := conn.Write(response); err != nil {
 				log.Println("Write error:", err)
-				conn.Close()
 				return
 			}
+
+		default:
+			log.Println("Invalid message type", buf[0])
+			return
 		}
 	}
 }
