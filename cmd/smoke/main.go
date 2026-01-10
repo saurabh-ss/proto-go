@@ -4,9 +4,18 @@ import (
 	"io"
 	"log"
 	"net"
+
+	"github.com/saurabh/protohackers/internal/logger"
 )
 
 func main() {
+	// Setup logging to logs directory
+	logFile, err := logger.Setup("smoke")
+	if err != nil {
+		panic(err)
+	}
+	defer logFile.Close()
+
 	ln, err := net.Listen("tcp", ":10001")
 	if err != nil {
 		panic(err)
