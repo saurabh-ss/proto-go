@@ -27,3 +27,6 @@ dist/
 *.swp
 *.swo
 *~
+
+# Logs
+logs/

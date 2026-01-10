@@ -30,6 +30,10 @@ clean: ## Remove build artifacts
 	@rm -rf $(BIN_DIR)
 	$(GOCLEAN)
 
+clean-logs: ## Remove log files
+	@echo "Cleaning logs..."
+	@rm -rf logs
+
 test: ## Run tests
 	$(GOTEST) -v ./...
 
