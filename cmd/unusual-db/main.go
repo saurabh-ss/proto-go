@@ -7,19 +7,14 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/saurabh/protohackers/internal/logger"
 )
 
 var port = flag.String("port", "50001", "Port to listen on")
-
-func handleConnection(conn net.Conn) {
-	log.Println("New connection from", conn.RemoteAddr())
-	defer conn.Close()
-	defer log.Println("Connection closed from", conn.RemoteAddr())
-
-}
 
 func main() {
 	flag.Parse()
@@ -31,13 +26,13 @@ func main() {
 	}
 	defer logFile.Close()
 
-	ln, err := net.Listen("tcp", ":"+*port)
+	conn, err := net.ListenPacket("udp", ":"+*port)
 	if err != nil {
 		panic(err)
 	}
-	defer ln.Close()
+	defer conn.Close()
 
-	log.Println("Listening on port " + *port)
+	log.Println("Listening for UDP packets on port " + *port)
 
 	// Setup context for graceful shutdown
 	ctx, cancel := context.WithCancel(context.Background())
@@ -51,21 +46,58 @@ func main() {
 		<-sigChan
 		log.Println("Shutting down gracefully...")
 		cancel()
-		ln.Close()
+		conn.Close()
 	}()
 
+	// All requests and responses must be shorter than 1000 bytes.
+	buffer := make([]byte, 1024)
+
+	db := make(map[string]string)
+	db["version"] = "Saurabh's Key-Value Store 1.0"
+	dbMu := sync.RWMutex{}
+
 	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			select {
-			case <-ctx.Done():
-				log.Println("Server stopped")
-				return
-			default:
-				log.Println("Accept error:", err)
-				continue
+		select {
+		case <-ctx.Done():
+			log.Println("Server stopped")
+			return
+		default:
+			n, addr, err := conn.ReadFrom(buffer)
+			if err != nil {
+				select {
+				case <-ctx.Done():
+					log.Println("Server stopped")
+					return
+				default:
+					log.Println("Read error:", err)
+					continue
+				}
+			}
+			// Handle each packet in a goroutine if you need concurrent processing
+			strbuf := string(buffer[:n])
+			parts := strings.SplitN(strbuf, "=", 2)
+			if len(parts) == 2 {
+				// SET request: key=value
+				log.Println("SET request:", parts[0], "=", parts[1])
+				if parts[0] == "version" {
+					continue
+				}
+				dbMu.Lock()
+				db[parts[0]] = parts[1]
+				dbMu.Unlock()
+				// No response needed for SET requests in typical key-value UDP protocol
+			} else if len(parts) == 1 {
+				// GET request: key
+				key := parts[0]
+				log.Println("GET request:", key)
+				dbMu.RLock()
+				value := db[key]
+				dbMu.RUnlock()
+				// Response format: key=value
+				response := key + "=" + value
+				conn.WriteTo([]byte(response), addr)
 			}
 		}
-		go handleConnection(conn)
 	}
+
 }
