@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/signal"
 	"strings"
-	"sync"
 	"syscall"
 
 	"github.com/saurabh/protohackers/internal/logger"
@@ -54,7 +53,6 @@ func main() {
 
 	db := make(map[string]string)
 	db["version"] = "Saurabh's Key-Value Store 1.0"
-	dbMu := sync.RWMutex{}
 
 	for {
 		select {
@@ -82,17 +80,13 @@ func main() {
 				if parts[0] == "version" {
 					continue
 				}
-				dbMu.Lock()
 				db[parts[0]] = parts[1]
-				dbMu.Unlock()
 				// No response needed for SET requests in typical key-value UDP protocol
 			} else if len(parts) == 1 {
 				// GET request: key
 				key := parts[0]
 				log.Println("GET request:", key)
-				dbMu.RLock()
 				value := db[key]
-				dbMu.RUnlock()
 				// Response format: key=value
 				response := key + "=" + value
 				conn.WriteTo([]byte(response), addr)
