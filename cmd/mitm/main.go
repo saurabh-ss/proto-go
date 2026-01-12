@@ -85,42 +85,27 @@ func handleConnection(conn net.Conn) {
 
 	done := make(chan struct{}, 2)
 
-	// Forward messages from client to chat server
-	go func() {
-		defer func() {
-			done <- struct{}{}
-		}()
-		reader := bufio.NewReader(conn)
-		for {
-			line, err := reader.ReadString('\n')
-			if err != nil {
-				return
-			}
-			log.Println("Received message from client:", strings.TrimSpace(line))
-			line = handleMessage(line)
-			upConn.Write([]byte(line))
-		}
-	}()
-
-	// Forward messages from chat server to client
-	go func() {
-		defer func() {
-			done <- struct{}{}
-		}()
-		upReader := bufio.NewReader(upConn)
-		for {
-			line, err := upReader.ReadString('\n')
-			if err != nil {
-				return
-			}
-			log.Println("Received message from chat server:", strings.TrimSpace(line))
-			line = handleMessage(line)
-			conn.Write([]byte(line))
-		}
-	}()
+	go proxy(conn, upConn, "client", done)
+	go proxy(upConn, conn, "chat server", done)
 
 	<-done
 	log.Println("Connection closed from", conn.RemoteAddr())
+}
+
+func proxy(src, dst net.Conn, label string, done chan struct{}) {
+	defer func() {
+		done <- struct{}{}
+	}()
+	reader := bufio.NewReader(src)
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return
+		}
+		log.Println("Received message from", label+":", strings.TrimSpace(line))
+		line = handleMessage(line)
+		dst.Write([]byte(line))
+	}
 }
 
 func handleMessage(message string) string {
