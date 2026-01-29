@@ -38,12 +38,12 @@ type PutRequest struct {
 
 type AbortRequest struct {
 	Request string `json:"request"`
-	Id      string `json:"id"`
+	Id      int    `json:"id"`
 }
 
 type DeleteRequest struct {
 	Request string `json:"request"`
-	Id      string `json:"id"`
+	Id      int    `json:"id"`
 }
 
 type JobServer struct {
@@ -57,6 +57,8 @@ type JobItem struct {
 	job   any
 	pri   uint32
 	index int
+	state string
+	owner net.Addr
 }
 
 type PriorityQueue []*JobItem
@@ -67,6 +69,12 @@ func (pq PriorityQueue) Len() int {
 
 // We need a max heap
 func (pq PriorityQueue) Less(i int, j int) bool {
+	if pq[i].state == "ready" && pq[j].state != "ready" {
+		return true
+	}
+	if pq[i].state != "ready" && pq[j].state == "ready" {
+		return false
+	}
 	return pq[i].pri > pq[j].pri
 }
 
@@ -100,7 +108,7 @@ func (pq *PriorityQueue) Peek() (*JobItem, error) {
 	return (*pq)[0], nil
 }
 
-func (js *JobServer) Put(queue string, job any, pri uint32) uint64 {
+func (js *JobServer) Put(queue string, job any, pri uint32, conn net.Conn) uint64 {
 	js.mu.Lock()
 	defer js.mu.Unlock()
 
@@ -111,39 +119,85 @@ func (js *JobServer) Put(queue string, job any, pri uint32) uint64 {
 	js.numJobs++
 
 	newJob := &JobItem{
-		id:  strconv.FormatUint(js.numJobs, 10),
-		job: job,
-		pri: pri,
+		id:    strconv.FormatUint(js.numJobs, 10),
+		job:   job,
+		pri:   pri,
+		state: "ready",
+		owner: nil,
 	}
 	heap.Push(js.queue[queue], newJob)
+	log.Println("Put job", newJob.id, "into queue", queue, "with priority", pri)
 	return js.numJobs
 }
 
-func (js *JobServer) Get(queues []string, wait bool) (string, error) {
+func (js *JobServer) Get(queues []string, wait bool, conn net.Conn) (*JobItem, string, error) {
 	js.mu.Lock()
 	defer js.mu.Unlock()
 
-	bestQueue := ""
-	bestJob := &JobItem{}
-	bestPri := uint32(0)
+	var bestJob *JobItem
+	var bestPri uint32
+	var bestQueue string
+
 	for _, queue := range queues {
-		if _, exists := js.queue[queue]; !exists {
-			log.Println("Queue not found:", queue)
+		pq, exists := js.queue[queue]
+		if !exists {
 			continue
 		}
-		job, err := js.queue[queue].Peek()
-		if bestJob == nil || (err != nil && job.pri >= bestPri) {
+		job, err := pq.Peek()
+		if err != nil { // queue is empty
+			continue
+		}
+		if job.state == "assigned" {
+			continue
+		}
+		if bestJob == nil || job.pri > bestPri {
 			bestJob = job
 			bestPri = job.pri
 			bestQueue = queue
 		}
 	}
 	if bestJob == nil {
-		log.Println("No job found")
-		return "", errors.New("no job found")
+		return nil, "", fmt.Errorf("no job found")
 	}
+	bestJob.state = "assigned"
+	bestJob.owner = conn.RemoteAddr()
+	heap.Fix(js.queue[bestQueue], bestJob.index)
+
 	log.Println("Got job", bestJob.id, "from queue", bestQueue, "with priority", bestPri)
-	return bestJob.id, nil
+	return bestJob, bestQueue, nil
+}
+
+func (js *JobServer) Abort(id string, conn net.Conn) error {
+	js.mu.Lock()
+	defer js.mu.Unlock()
+	for _, pq := range js.queue {
+		for _, job := range *pq {
+			if job.id == id && job.owner == conn.RemoteAddr() {
+				job.state = "ready"
+				job.owner = nil
+				heap.Fix(pq, job.index)
+				log.Println("Aborted job", job.id)
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf("job not found")
+}
+
+func (js *JobServer) Delete(id string, conn net.Conn) error {
+	js.mu.Lock()
+	defer js.mu.Unlock()
+	for _, pq := range js.queue {
+		for _, job := range *pq {
+			if job.id == id {
+				heap.Remove(pq, job.index)
+				js.numJobs--
+				log.Println("Deleted job", job.id)
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf("job not found")
 }
 
 var port = flag.String("port", "50001", "Port to listen on")
@@ -238,40 +292,72 @@ func handleConnection(conn net.Conn, js *JobServer) {
 				_ = enc.Encode(map[string]any{"status": "error", "error": "Unmarshal error: " + err.Error()})
 				continue
 			}
-			jobId, _ := js.Get(getReq.Queues, getReq.Wait)
-			if jobId != "" {
-				_ = enc.Encode(map[string]any{"status": "ok", "id": jobId})
-			} else {
-				_ = enc.Encode(map[string]any{"status": "no-job"})
+
+			bestJob, bestQueue, err := js.Get(getReq.Queues, getReq.Wait, conn)
+			if err != nil {
+				if err := enc.Encode(map[string]any{"status": "no-job"}); err != nil {
+					log.Println("Encode error:", err)
+					return // Close connection on encode error
+				}
+				continue
 			}
+
+			if err := enc.Encode(map[string]any{
+				"status": "ok",
+				"id":     bestJob.id,
+				"job":    bestJob.job,
+				"pri":    bestJob.pri,
+				"queue":  bestQueue,
+			}); err != nil {
+				log.Println("Encode error:", err)
+				return // Close connection on encode error
+			}
+
 		case "put":
-			log.Println("Put request:", raw)
+			log.Println("Put request:", string(raw))
 			var putReq PutRequest
 			if err := json.Unmarshal(raw, &putReq); err != nil {
 				log.Println("Unmarshal error:", err)
 				_ = enc.Encode(map[string]any{"status": "error", "error": "Unmarshal error: " + err.Error()})
 				continue
 			}
-			js.Put(putReq.Queue, putReq.Job, putReq.Pri)
+			jobId := js.Put(putReq.Queue, putReq.Job, putReq.Pri, conn)
+			_ = enc.Encode(map[string]any{"status": "ok", "id": jobId})
 
 		case "abort":
-			log.Println("Abort request:", raw)
+			log.Println("Abort request:", string(raw))
 			var abortReq AbortRequest
 			if err := json.Unmarshal(raw, &abortReq); err != nil {
 				log.Println("Unmarshal error:", err)
 				_ = enc.Encode(map[string]any{"status": "error", "error": "Unmarshal error: " + err.Error()})
 				continue
 			}
+
+			err := js.Abort(strconv.Itoa(abortReq.Id), conn)
+			if err != nil {
+				_ = enc.Encode(map[string]any{"status": "no-job"})
+			} else {
+				_ = enc.Encode(map[string]any{"status": "ok"})
+			}
+
 		case "delete":
-			log.Println("Delete request:", raw)
+			log.Println("Delete request:", string(raw))
 			var deleteReq DeleteRequest
 			if err := json.Unmarshal(raw, &deleteReq); err != nil {
 				log.Println("Unmarshal error:", err)
 				_ = enc.Encode(map[string]any{"status": "error", "error": "Unmarshal error: " + err.Error()})
 				continue
 			}
+
+			err := js.Delete(strconv.Itoa(deleteReq.Id), conn)
+			if err != nil {
+				_ = enc.Encode(map[string]any{"status": "no-job"})
+			} else {
+				_ = enc.Encode(map[string]any{"status": "ok"})
+			}
+
 		default:
-			log.Println("Invalid request:", raw)
+			log.Println("Invalid request:", string(raw))
 			_ = enc.Encode(map[string]any{"status": "error", "error": "Unrecognised request type."})
 		}
 	}
