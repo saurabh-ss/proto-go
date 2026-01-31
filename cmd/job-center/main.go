@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"container/heap"
 	"context"
 	"encoding/json"
@@ -50,6 +51,7 @@ type JobServer struct {
 	queue   map[string]*PriorityQueue // queue name -> priority queue
 	mu      sync.RWMutex
 	numJobs uint64
+	cond    *sync.Cond
 }
 
 type JobItem struct {
@@ -127,6 +129,8 @@ func (js *JobServer) Put(queue string, job any, pri uint32, conn net.Conn) uint6
 	}
 	heap.Push(js.queue[queue], newJob)
 	log.Println("Put job", newJob.id, "into queue", queue, "with priority", pri)
+
+	js.cond.Broadcast()
 	return js.numJobs
 }
 
@@ -134,49 +138,60 @@ func (js *JobServer) Get(queues []string, wait bool, conn net.Conn) (*JobItem, s
 	js.mu.Lock()
 	defer js.mu.Unlock()
 
-	var bestJob *JobItem
-	var bestPri uint32
-	var bestQueue string
+	for {
+		var bestJob *JobItem
+		var bestPri uint32
+		var bestQueue string
 
-	for _, queue := range queues {
-		pq, exists := js.queue[queue]
-		if !exists {
-			continue
-		}
-		job, err := pq.Peek()
-		if err != nil { // queue is empty
-			continue
-		}
-		if job.state == "assigned" {
-			continue
-		}
-		if bestJob == nil || job.pri > bestPri {
-			bestJob = job
-			bestPri = job.pri
-			bestQueue = queue
-		}
-	}
-	if bestJob == nil {
-		return nil, "", fmt.Errorf("no job found")
-	}
-	bestJob.state = "assigned"
-	bestJob.owner = conn.RemoteAddr()
-	heap.Fix(js.queue[bestQueue], bestJob.index)
+		for _, queue := range queues {
+			pq, exists := js.queue[queue]
+			if !exists {
+				continue
+			}
+			job, err := pq.Peek()
 
-	log.Println("Got job", bestJob.id, "from queue", bestQueue, "with priority", bestPri)
-	return bestJob, bestQueue, nil
+			// Skip empty queues or assigned jobs
+			if err != nil || job.state == "assigned" {
+				continue
+			}
+			if bestJob == nil || job.pri > bestPri {
+				bestJob = job
+				bestPri = job.pri
+				bestQueue = queue
+			}
+		}
+
+		// Found a job, so assign it to the connection
+		if bestJob != nil {
+			bestJob.state = "assigned"
+			bestJob.owner = conn.RemoteAddr()
+			heap.Fix(js.queue[bestQueue], bestJob.index)
+			log.Println("Got job", bestJob.id, "from queue", bestQueue, "with priority", bestPri)
+			return bestJob, bestQueue, nil
+		}
+
+		if !wait {
+			return nil, "", fmt.Errorf("no job found")
+		}
+
+		js.cond.Wait()
+	}
 }
 
 func (js *JobServer) Abort(id string, conn net.Conn) error {
 	js.mu.Lock()
 	defer js.mu.Unlock()
+
+	disconnected := id == ""
+
 	for _, pq := range js.queue {
 		for _, job := range *pq {
-			if job.id == id && job.owner == conn.RemoteAddr() {
+			if job.owner == conn.RemoteAddr() && (disconnected || job.id == id) {
 				job.state = "ready"
 				job.owner = nil
 				heap.Fix(pq, job.index)
 				log.Println("Aborted job", job.id)
+				js.cond.Broadcast()
 				return nil
 			}
 		}
@@ -191,7 +206,6 @@ func (js *JobServer) Delete(id string, conn net.Conn) error {
 		for _, job := range *pq {
 			if job.id == id {
 				heap.Remove(pq, job.index)
-				js.numJobs--
 				log.Println("Deleted job", job.id)
 				return nil
 			}
@@ -239,6 +253,7 @@ func main() {
 		queue:   make(map[string]*PriorityQueue),
 		numJobs: uint64(0),
 	}
+	js.cond = sync.NewCond(&js.mu)
 
 	for {
 		conn, err := ln.Accept()
@@ -260,26 +275,44 @@ func handleConnection(conn net.Conn, js *JobServer) {
 	log.Println("New connection from", conn.RemoteAddr())
 	defer conn.Close()
 
-	dec := json.NewDecoder(conn)
-	enc := json.NewEncoder(conn)
-	enc.SetEscapeHTML(false)
+	reader := bufio.NewReader(conn)
+	writer := bufio.NewWriter(conn)
 
 	for {
 
 		// The server must not close the connection in response to an invalid request.
-		var raw json.RawMessage
-		if err := dec.Decode(&raw); err != nil {
+		// Read line-by-line (each request is terminated by newline)
+		line, err := reader.ReadBytes('\n')
+		if err != nil {
 			if errors.Is(err, io.EOF) {
+				log.Println("Connection closed from", conn.RemoteAddr())
+				js.Abort("", conn)
 				return
 			}
-			log.Println("Decode error:", err)
-			_ = enc.Encode(map[string]any{"status": "error", "error": "Decode error: " + err.Error()})
+			log.Println("Read error:", err)
+			response, _ := json.Marshal(map[string]any{"status": "error", "error": "Read error: " + err.Error()})
+			writer.Write(response)
+			writer.WriteByte('\n')
+			writer.Flush()
+			continue
+		}
+
+		var raw json.RawMessage
+		if err := json.Unmarshal(line, &raw); err != nil {
+			log.Println("Unmarshal error:", err)
+			response, _ := json.Marshal(map[string]any{"status": "error", "error": "Unmarshal error: " + err.Error()})
+			writer.Write(response)
+			writer.WriteByte('\n')
+			writer.Flush()
 			continue
 		}
 		var req BaseRequest
 		if err := json.Unmarshal(raw, &req); err != nil {
 			log.Println("Unmarshal error:", err)
-			_ = enc.Encode(map[string]any{"status": "error", "error": "Unmarshal error: " + err.Error()})
+			response, _ := json.Marshal(map[string]any{"status": "error", "error": "Unmarshal error: " + err.Error()})
+			writer.Write(response)
+			writer.WriteByte('\n')
+			writer.Flush()
 			continue
 		}
 
@@ -289,28 +322,45 @@ func handleConnection(conn net.Conn, js *JobServer) {
 			var getReq GetRequest
 			if err := json.Unmarshal(raw, &getReq); err != nil {
 				log.Println("Unmarshal error:", err)
-				_ = enc.Encode(map[string]any{"status": "error", "error": "Unmarshal error: " + err.Error()})
+				response, _ := json.Marshal(map[string]any{"status": "error", "error": "Unmarshal error: " + err.Error()})
+				writer.Write(response)
+				writer.WriteByte('\n')
+				writer.Flush()
 				continue
 			}
 
 			bestJob, bestQueue, err := js.Get(getReq.Queues, getReq.Wait, conn)
 			if err != nil {
-				if err := enc.Encode(map[string]any{"status": "no-job"}); err != nil {
-					log.Println("Encode error:", err)
-					return // Close connection on encode error
+				response, marshalErr := json.Marshal(map[string]any{"status": "no-job"})
+				if marshalErr != nil {
+					log.Println("Marshal error:", marshalErr)
+					return // Close connection on marshal error
+				}
+				writer.Write(response)
+				writer.WriteByte('\n')
+				if err := writer.Flush(); err != nil {
+					log.Println("Write error:", err)
+					return
 				}
 				continue
 			}
 
-			if err := enc.Encode(map[string]any{
+			response, marshalErr := json.Marshal(map[string]any{
 				"status": "ok",
 				"id":     bestJob.id,
 				"job":    bestJob.job,
 				"pri":    bestJob.pri,
 				"queue":  bestQueue,
-			}); err != nil {
-				log.Println("Encode error:", err)
-				return // Close connection on encode error
+			})
+			if marshalErr != nil {
+				log.Println("Marshal error:", marshalErr)
+				return // Close connection on marshal error
+			}
+			writer.Write(response)
+			writer.WriteByte('\n')
+			if err := writer.Flush(); err != nil {
+				log.Println("Write error:", err)
+				return
 			}
 
 		case "put":
@@ -318,47 +368,71 @@ func handleConnection(conn net.Conn, js *JobServer) {
 			var putReq PutRequest
 			if err := json.Unmarshal(raw, &putReq); err != nil {
 				log.Println("Unmarshal error:", err)
-				_ = enc.Encode(map[string]any{"status": "error", "error": "Unmarshal error: " + err.Error()})
+				response, _ := json.Marshal(map[string]any{"status": "error", "error": "Unmarshal error: " + err.Error()})
+				writer.Write(response)
+				writer.WriteByte('\n')
+				writer.Flush()
 				continue
 			}
 			jobId := js.Put(putReq.Queue, putReq.Job, putReq.Pri, conn)
-			_ = enc.Encode(map[string]any{"status": "ok", "id": jobId})
+			response, _ := json.Marshal(map[string]any{"status": "ok", "id": jobId})
+			writer.Write(response)
+			writer.WriteByte('\n')
+			writer.Flush()
 
 		case "abort":
 			log.Println("Abort request:", string(raw))
 			var abortReq AbortRequest
 			if err := json.Unmarshal(raw, &abortReq); err != nil {
 				log.Println("Unmarshal error:", err)
-				_ = enc.Encode(map[string]any{"status": "error", "error": "Unmarshal error: " + err.Error()})
+				response, _ := json.Marshal(map[string]any{"status": "error", "error": "Unmarshal error: " + err.Error()})
+				writer.Write(response)
+				writer.WriteByte('\n')
+				writer.Flush()
 				continue
 			}
 
 			err := js.Abort(strconv.Itoa(abortReq.Id), conn)
+			var response []byte
 			if err != nil {
-				_ = enc.Encode(map[string]any{"status": "no-job"})
+				response, _ = json.Marshal(map[string]any{"status": "no-job"})
 			} else {
-				_ = enc.Encode(map[string]any{"status": "ok"})
+				response, _ = json.Marshal(map[string]any{"status": "ok"})
 			}
+			writer.Write(response)
+			writer.WriteByte('\n')
+			writer.Flush()
 
 		case "delete":
 			log.Println("Delete request:", string(raw))
 			var deleteReq DeleteRequest
 			if err := json.Unmarshal(raw, &deleteReq); err != nil {
 				log.Println("Unmarshal error:", err)
-				_ = enc.Encode(map[string]any{"status": "error", "error": "Unmarshal error: " + err.Error()})
+				response, _ := json.Marshal(map[string]any{"status": "error", "error": "Unmarshal error: " + err.Error()})
+				writer.Write(response)
+				writer.WriteByte('\n')
+				writer.Flush()
 				continue
 			}
 
 			err := js.Delete(strconv.Itoa(deleteReq.Id), conn)
+			var response []byte
 			if err != nil {
-				_ = enc.Encode(map[string]any{"status": "no-job"})
+				response, _ = json.Marshal(map[string]any{"status": "no-job"})
 			} else {
-				_ = enc.Encode(map[string]any{"status": "ok"})
+				response, _ = json.Marshal(map[string]any{"status": "ok"})
 			}
+			writer.Write(response)
+			writer.WriteByte('\n')
+			writer.Flush()
 
 		default:
 			log.Println("Invalid request:", string(raw))
-			_ = enc.Encode(map[string]any{"status": "error", "error": "Unrecognised request type."})
+			response, _ := json.Marshal(map[string]any{"status": "error", "error": "Unrecognised request type."})
+			writer.Write(response)
+			writer.WriteByte('\n')
+			writer.Flush()
 		}
 	}
+
 }
