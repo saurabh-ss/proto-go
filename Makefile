@@ -23,33 +23,32 @@ endif
 # Find all cmd directories
 CMDS := $(wildcard cmd/*)
 CMD_NAMES := $(notdir $(CMDS))
+BINARIES := $(patsubst cmd/%,$(BIN_DIR)/%,$(CMDS))
+DARWIN_BINARIES := $(patsubst cmd/%,$(BIN_DIR)/darwin/%-arm64,$(CMDS))
+LINUX_BINARIES := $(patsubst cmd/%,$(BIN_DIR)/linux/%,$(CMDS))
 
 all: build ## Build binaries for current OS
 
-build: ## Build binaries for current OS
+build: $(BINARIES) ## Build binaries for current OS
+
+$(BIN_DIR)/%: cmd/%/main.go
 	@mkdir -p $(BIN_DIR)
-	@for cmd in $(CMD_NAMES); do \
-		echo "Building $$cmd for $(GOOS_DEFAULT)..."; \
-		$(GOBUILD) -o $(BIN_DIR)/$$cmd ./cmd/$$cmd; \
-	done
+	@echo "Building $*..."
+	$(GOBUILD) -o $@ ./cmd/$*
 
-build-darwin: ## Build binaries for macOS (Intel and ARM)
+build-darwin: $(DARWIN_BINARIES) ## Build binaries for macOS (ARM)
+
+$(BIN_DIR)/darwin/%-arm64: cmd/%/main.go
 	@mkdir -p $(BIN_DIR)/darwin
-	@for cmd in $(CMD_NAMES); do \
-		echo "Building $$cmd for darwin/amd64..."; \
-		GOOS=darwin GOARCH=amd64 $(GOBUILD) -o $(BIN_DIR)/darwin/$$cmd-amd64 ./cmd/$$cmd; \
-		echo "Building $$cmd for darwin/arm64..."; \
-		GOOS=darwin GOARCH=arm64 $(GOBUILD) -o $(BIN_DIR)/darwin/$$cmd-arm64 ./cmd/$$cmd; \
-	done
+	@echo "Building $* for darwin/arm64..."
+	GOOS=darwin GOARCH=arm64 $(GOBUILD) -o $@ ./cmd/$*
 
-build-linux: ## Build binaries for Linux (Intel and ARM)
+build-linux: $(LINUX_BINARIES) ## Build binaries for Linux (x86-64)
+
+$(BIN_DIR)/linux/%: cmd/%/main.go
 	@mkdir -p $(BIN_DIR)/linux
-	@for cmd in $(CMD_NAMES); do \
-		echo "Building $$cmd for linux/amd64..."; \
-		GOOS=linux GOARCH=amd64 $(GOBUILD) -o $(BIN_DIR)/linux/$$cmd-amd64 ./cmd/$$cmd; \
-		echo "Building $$cmd for linux/arm64..."; \
-		GOOS=linux GOARCH=arm64 $(GOBUILD) -o $(BIN_DIR)/linux/$$cmd-arm64 ./cmd/$$cmd; \
-	done
+	@echo "Building $* for linux/amd64..."
+	GOOS=linux GOARCH=amd64 $(GOBUILD) -o $@ ./cmd/$*
 
 build-all: build-darwin build-linux ## Build binaries for all platforms (macOS and Linux)
 
