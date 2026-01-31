@@ -13,8 +13,8 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 
 	"github.com/saurabh/protohackers/internal/logger"
@@ -39,23 +39,23 @@ type PutRequest struct {
 
 type AbortRequest struct {
 	Request string `json:"request"`
-	Id      int    `json:"id"`
+	Id      uint64 `json:"id"`
 }
 
 type DeleteRequest struct {
 	Request string `json:"request"`
-	Id      int    `json:"id"`
+	Id      uint64 `json:"id"`
 }
 
 type JobServer struct {
 	queue   map[string]*PriorityQueue // queue name -> priority queue
 	mu      sync.RWMutex
-	numJobs uint64
 	cond    *sync.Cond
+	counter atomic.Uint64
 }
 
 type JobItem struct {
-	id    string
+	id    uint64
 	job   any
 	pri   uint32
 	index int
@@ -118,10 +118,10 @@ func (js *JobServer) Put(queue string, job any, pri uint32, conn net.Conn) uint6
 		js.queue[queue] = &PriorityQueue{}
 		heap.Init(js.queue[queue])
 	}
-	js.numJobs++
+	id := js.counter.Add(1)
 
 	newJob := &JobItem{
-		id:    strconv.FormatUint(js.numJobs, 10),
+		id:    id,
 		job:   job,
 		pri:   pri,
 		state: "ready",
@@ -131,7 +131,7 @@ func (js *JobServer) Put(queue string, job any, pri uint32, conn net.Conn) uint6
 	log.Println("Put job", newJob.id, "into queue", queue, "with priority", pri)
 
 	js.cond.Broadcast()
-	return js.numJobs
+	return id
 }
 
 func (js *JobServer) Get(queues []string, wait bool, conn net.Conn) (*JobItem, string, error) {
@@ -178,11 +178,9 @@ func (js *JobServer) Get(queues []string, wait bool, conn net.Conn) (*JobItem, s
 	}
 }
 
-func (js *JobServer) Abort(id string, conn net.Conn) error {
+func (js *JobServer) Abort(id uint64, conn net.Conn, disconnected bool) error {
 	js.mu.Lock()
 	defer js.mu.Unlock()
-
-	disconnected := id == ""
 
 	for _, pq := range js.queue {
 		for _, job := range *pq {
@@ -199,7 +197,7 @@ func (js *JobServer) Abort(id string, conn net.Conn) error {
 	return fmt.Errorf("job not found")
 }
 
-func (js *JobServer) Delete(id string, conn net.Conn) error {
+func (js *JobServer) Delete(id uint64, conn net.Conn) error {
 	js.mu.Lock()
 	defer js.mu.Unlock()
 	for _, pq := range js.queue {
@@ -251,9 +249,10 @@ func main() {
 
 	js := JobServer{
 		queue:   make(map[string]*PriorityQueue),
-		numJobs: uint64(0),
+		counter: atomic.Uint64{},
 	}
 	js.cond = sync.NewCond(&js.mu)
+	js.counter.Store(0)
 
 	for {
 		conn, err := ln.Accept()
@@ -286,7 +285,7 @@ func handleConnection(conn net.Conn, js *JobServer) {
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				log.Println("Connection closed from", conn.RemoteAddr())
-				js.Abort("", conn)
+				js.Abort(0, conn, true)
 				return
 			}
 			log.Println("Read error:", err)
@@ -392,7 +391,7 @@ func handleConnection(conn net.Conn, js *JobServer) {
 				continue
 			}
 
-			err := js.Abort(strconv.Itoa(abortReq.Id), conn)
+			err := js.Abort(abortReq.Id, conn, false)
 			var response []byte
 			if err != nil {
 				response, _ = json.Marshal(map[string]any{"status": "no-job"})
@@ -415,7 +414,7 @@ func handleConnection(conn net.Conn, js *JobServer) {
 				continue
 			}
 
-			err := js.Delete(strconv.Itoa(deleteReq.Id), conn)
+			err := js.Delete(deleteReq.Id, conn)
 			var response []byte
 			if err != nil {
 				response, _ = json.Marshal(map[string]any{"status": "no-job"})
