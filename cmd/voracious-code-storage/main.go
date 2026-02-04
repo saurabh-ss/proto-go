@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"flag"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,47 +25,106 @@ type File struct {
 }
 
 type VersionedFile struct {
-	mu       sync.RWMutex
 	Versions []*File
 }
 
 type VCS struct {
-	files sync.Map // map with name as key and VersionedFile as value
+	files map[string]*VersionedFile // map with name as key and VersionedFile as value
+	mu    sync.RWMutex
 }
 
 func (v *VCS) Put(filename string, data []byte) int {
-	val, _ := v.files.LoadOrStore(filename, &VersionedFile{})
-	vf := val.(*VersionedFile)
+	v.mu.Lock()
+	defer v.mu.Unlock()
 
-	vf.mu.Lock()
-	defer vf.mu.Unlock()
-
+	vf, ok := v.files[filename]
+	if !ok {
+		vf = &VersionedFile{Versions: make([]*File, 0)}
+		v.files[filename] = vf
+	}
+	if n := len(vf.Versions); n > 0 && bytes.Equal(vf.Versions[n-1].Data, data) {
+		return n
+	}
 	vf.Versions = append(vf.Versions, &File{Data: data})
 	return len(vf.Versions)
 }
 
 func (v *VCS) Get(filename string, revision string) ([]byte, error) {
-	val, ok := v.files.Load(filename)
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+
+	vf, ok := v.files[filename]
 	if !ok {
 		return nil, fmt.Errorf("no such file")
 	}
-
-	vf := val.(*VersionedFile)
-	vf.mu.RLock()
-	defer vf.mu.RUnlock()
 
 	var r int
 	var err error
 	if revision == "latest" {
 		r = len(vf.Versions)
 	} else {
-		r, err = strconv.Atoi(revision)
-		if err != nil || r < 0 || r > len(vf.Versions) {
+		if revision[0] == 'r' {
+			r, err = strconv.Atoi(revision[1:])
+		} else {
+			r, err = strconv.Atoi(revision)
+		}
+		if err != nil || r <= 0 || r > len(vf.Versions) {
 			return nil, fmt.Errorf("no such revision")
 		}
 	}
 
 	return vf.Versions[r-1].Data, nil
+}
+
+func (v *VCS) GetLatestVersion(filename string) int {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+
+	vf, ok := v.files[filename]
+	if !ok {
+		return 0
+	}
+
+	return len(vf.Versions)
+}
+
+func (v *VCS) List(dir string) ([]string, []string, error) {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+
+	// Normalize directory path - ensure it ends with /
+	if !strings.HasSuffix(dir, "/") {
+		dir = dir + "/"
+	}
+
+	files := make([]string, 0)
+	dirSet := make(map[string]bool) // Use map to track unique directories
+
+	for file := range v.files {
+		if after, ok := strings.CutPrefix(file, dir); ok {
+			// Get the relative path after the directory
+			relativePath := after
+
+			if strings.Contains(relativePath, "/") {
+				// It's in a subdirectory - extract the first directory component
+				dirName := strings.Split(relativePath, "/")[0]
+				dirSet[dirName] = true
+			} else if relativePath != "" {
+				// It's a file directly in this directory
+				files = append(files, relativePath)
+			}
+		}
+	}
+
+	// Convert map keys to slice
+	directories := make([]string, 0, len(dirSet))
+	for dir := range dirSet {
+		directories = append(directories, dir)
+	}
+
+	sort.Strings(files)
+	sort.Strings(directories)
+	return files, directories, nil
 }
 
 var port = flag.String("port", "50001", "Port to listen on")
@@ -101,7 +162,7 @@ func main() {
 		ln.Close()
 	}()
 
-	vcs := VCS{}
+	vcs := &VCS{files: make(map[string]*VersionedFile)}
 
 	for {
 		conn, err := ln.Accept()
@@ -115,8 +176,57 @@ func main() {
 				continue
 			}
 		}
-		go handleConnection(conn, &vcs)
+		go handleConnection(conn, vcs)
 	}
+}
+
+func isValidPath(path string, allowDirectory bool) bool {
+	if len(path) == 0 || path[0] != '/' {
+		return false
+	}
+
+	endsWithSlash := path[len(path)-1] == '/'
+
+	// If it ends with /, it must be a directory
+	if endsWithSlash && !allowDirectory {
+		return false
+	}
+
+	if strings.Contains(path, "//") {
+		return false
+	}
+
+	for _, char := range path {
+		if (char >= 'a' && char <= 'z') ||
+			(char >= 'A' && char <= 'Z') ||
+			(char >= '0' && char <= '9') ||
+			char == '/' || char == '-' || char == '_' || char == '.' {
+			continue
+		}
+
+		return false
+	}
+
+	return true
+}
+
+// isValidFilename checks if a filename is valid (must not end with /)
+func isValidFilename(filename string) bool {
+	return isValidPath(filename, false)
+}
+
+// isValidDirectory checks if a directory path is valid (can end with / or not)
+func isValidDirectory(dir string) bool {
+	return isValidPath(dir, true)
+}
+
+func isValidTextData(data []byte) bool {
+	for _, b := range data {
+		if !(b >= 32 && b <= 126) && b != '\n' && b != '\r' && b != '\t' {
+			return false
+		}
+	}
+	return true
 }
 
 func handleConnection(conn net.Conn, vcs *VCS) {
@@ -175,7 +285,11 @@ func handleConnection(conn net.Conn, vcs *VCS) {
 			return
 		}
 		fileName := parts[1]
-		_ = fileName
+		if !isValidFilename(fileName) {
+			writeLine("ERR illegal file name")
+			writeLine("READY")
+			return
+		}
 		length, err := strconv.Atoi(parts[2])
 		if err != nil {
 			writeLine("ERR usage: PUT file length newline data")
@@ -193,6 +307,14 @@ func handleConnection(conn net.Conn, vcs *VCS) {
 			writeLine("READY")
 			return
 		}
+
+		// Validate that data is text only
+		if !isValidTextData(data) {
+			writeLine("ERR text files only")
+			writeLine("READY")
+			return
+		}
+
 		revision := vcs.Put(fileName, data)
 		writeLine("OK r" + strconv.Itoa(revision))
 		writeLine("READY")
@@ -202,7 +324,34 @@ func handleConnection(conn net.Conn, vcs *VCS) {
 		if len(parts) != 2 {
 			writeLine("ERR usage: LIST dir")
 			writeLine("READY")
+			return
 		}
+
+		dir := parts[1]
+		if !isValidDirectory(dir) {
+			writeLine("ERR illegal dir name")
+			writeLine("READY")
+			return
+		}
+
+		files, directories, err := vcs.List(dir)
+		if err != nil {
+			log.Println("List error:", err)
+			return
+		}
+		log.Println("files:", files)
+		log.Println("directories:", directories)
+		total := len(files) + len(directories)
+		writeLine("OK " + strconv.Itoa(total))
+
+		for _, directory := range directories {
+			writeLine(directory + "/" + " DIR")
+		}
+		for _, file := range files {
+			writeLine(file + " r" + strconv.Itoa(vcs.GetLatestVersion(file)))
+		}
+
+		writeLine("READY")
 
 	}
 
