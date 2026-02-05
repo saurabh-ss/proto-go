@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"flag"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -66,4 +68,43 @@ func main() {
 func handleConnection(conn net.Conn) {
 	log.Println("New connection from", conn.RemoteAddr())
 	defer conn.Close()
+
+	reader := bufio.NewReader(conn)
+	writer := bufio.NewWriter(conn)
+
+	cipher, err := reader.ReadBytes(0x00)
+	if err != nil {
+		log.Println("Read error:", err)
+		return
+	}
+
+	if len(cipher) > 0 {
+		cipher = cipher[:len(cipher)-1]
+	}
+
+	if len(cipher) == 0 {
+		log.Println("No cipher received")
+		return
+	}
+
+	for {
+		data, err := reader.ReadBytes(0x0A)
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			log.Println("Read error:", err)
+			return
+		}
+
+		log.Println("Received data:", string(data))
+
+		if len(data) > 0 {
+			data = data[:len(data)-1]
+		}
+
+	}
+
+	writer.Write(cipher)
+	writer.Flush()
 }
