@@ -169,8 +169,14 @@ func handleConnection(conn net.Conn) {
 	cipher := parseCipher(data)
 	log.Printf("Parsed cipher: %d operations\n", len(cipher))
 
+	// Initialize position counters for the connection
+	requestPos := 0
+	responsePos := 0
+
+	// Buffer. Clients won't send lines longer than 5000 characters.
+	buffer := make([]byte, 8192)
 	for {
-		data, err := reader.ReadBytes(encrypt([]byte{NewLine}, cipher)[0])
+		n, err := reader.Read(buffer)
 		if err != nil {
 			if err == io.EOF {
 				break
@@ -178,22 +184,32 @@ func handleConnection(conn net.Conn) {
 			log.Println("Read error:", err)
 			return
 		}
-
+		data := buffer[:n]
 		log.Println("Received message:", data)
 
-		decrypted := decrypt(data, cipher)
+		decrypted := decrypt(data, cipher, requestPos)
+		requestPos += n // Update request position counter
+
+		// decString := string(decrypted)
+		log.Println("Decrypted message:", decrypted)
+
 		if bytes.Equal(decrypted, data) {
 			log.Println("Decrypted message is the same as the original message")
 			return
 		}
 
-		decString := string(decrypted)
-		log.Println("Decrypted message:", decString)
+		// Find the position of the ASCII newline character (0x0A) in the decrypted byte array
+		newlineIdx := bytes.IndexByte(decrypted, NewLine)
+		if newlineIdx == -1 {
+			panic("No newline found in decrypted message")
+		}
 
-		result := getMaxCountPart(decString)
-		log.Println("Part with max count: ", result)
+		// result := getMaxCountPart(decString)
+		result := getMaxCountPartFromDecrypted(decrypted)
+		log.Println("Part with max count: ", string(result))
 
-		encrypted := encrypt([]byte(result), cipher)
+		encrypted := encrypt([]byte(result), cipher, responsePos)
+		responsePos += len(result) // Update response position counter
 
 		writer.Write(encrypted)
 		writer.Flush()
@@ -201,7 +217,7 @@ func handleConnection(conn net.Conn) {
 
 }
 
-func decrypt(data []byte, cipher []CipherOp) []byte {
+func decrypt(data []byte, cipher []CipherOp, pos int) []byte {
 	if len(data) == 0 || len(cipher) == 0 {
 		return data
 	}
@@ -217,17 +233,17 @@ func decrypt(data []byte, cipher []CipherOp) []byte {
 		case OpXor:
 			data = xor(data, op.Arg) // XOR is its own inverse
 		case OpXorPos:
-			data = xorPos(data) // XorPos is its own inverse
+			data = xorPos(data, pos) // XorPos is its own inverse
 		case OpAdd:
 			data = sub(data, op.Arg) // inverse of add is sub
 		case OpAddPos:
-			data = subPos(data) // inverse of addPos is subPos
+			data = subPos(data, pos) // inverse of addPos is subPos
 		}
 	}
 	return data
 }
 
-func encrypt(data []byte, cipher []CipherOp) []byte {
+func encrypt(data []byte, cipher []CipherOp, pos int) []byte {
 	if len(data) == 0 || len(cipher) == 0 {
 		return data
 	}
@@ -241,11 +257,11 @@ func encrypt(data []byte, cipher []CipherOp) []byte {
 		case OpXor:
 			data = xor(data, op.Arg)
 		case OpXorPos:
-			data = xorPos(data)
+			data = xorPos(data, pos)
 		case OpAdd:
 			data = add(data, op.Arg)
 		case OpAddPos:
-			data = addPos(data)
+			data = addPos(data, pos)
 		}
 	}
 	return data
@@ -267,10 +283,10 @@ func xor(data []byte, N byte) []byte {
 	return result
 }
 
-func xorPos(data []byte) []byte {
+func xorPos(data []byte, offset int) []byte {
 	result := make([]byte, len(data))
 	for i := range data {
-		result[i] = data[i] ^ byte(i)
+		result[i] = data[i] ^ byte(offset+i)
 	}
 	return result
 }
@@ -283,10 +299,10 @@ func add(data []byte, N byte) []byte {
 	return result
 }
 
-func addPos(data []byte) []byte {
+func addPos(data []byte, offset int) []byte {
 	result := make([]byte, len(data))
 	for i := range data {
-		result[i] = (data[i] + byte(i)) & 0xFF
+		result[i] = (data[i] + byte(offset+i)) & 0xFF
 	}
 	return result
 }
@@ -299,10 +315,10 @@ func sub(data []byte, N byte) []byte {
 	return result
 }
 
-func subPos(data []byte) []byte {
+func subPos(data []byte, offset int) []byte {
 	result := make([]byte, len(data))
 	for i := range data {
-		result[i] = data[i] - byte(i)
+		result[i] = data[i] - byte(offset+i)
 	}
 	return result
 }
@@ -323,4 +339,56 @@ func getMaxCountPart(data string) string {
 		}
 	}
 	return strings.TrimSpace(result) + "\n"
+}
+
+func getMaxCountPartFromDecrypted(data []byte) []byte {
+	// Find the newline to get the complete line
+	newlineIdx := bytes.IndexByte(data, NewLine)
+	if newlineIdx == -1 {
+		panic("No newline found in decrypted message")
+	}
+
+	// Work with the line up to the newline
+	line := data[:newlineIdx]
+
+	// Split by comma
+	var maxPart []byte
+	maxCount := 0
+	start := 0
+
+	for i := 0; i <= len(line); i++ {
+		// Check if we hit a comma or end of line
+		if i == len(line) || line[i] == Comma {
+			part := line[start:i]
+
+			// Find 'x' in this part
+			xIdx := bytes.IndexByte(part, XChar)
+			if xIdx == -1 {
+				panic("No 'x' found in part: " + string(part))
+			}
+
+			// Parse the count (everything before 'x')
+			countStr := string(part[:xIdx])
+			var count int
+			_, err := fmt.Sscanf(countStr, "%d", &count)
+			if err != nil {
+				panic("Couldn't parse count in part: " + string(part))
+			}
+
+			// Update max if this count is larger
+			if count > maxCount {
+				maxCount = count
+				maxPart = bytes.TrimSpace(part)
+			}
+
+			// Move start to after the comma
+			start = i + 1
+		}
+	}
+
+	// Append newline and return
+	result := make([]byte, len(maxPart)+1)
+	copy(result, maxPart)
+	result[len(maxPart)] = NewLine
+	return result
 }
