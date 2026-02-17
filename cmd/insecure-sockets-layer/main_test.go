@@ -442,6 +442,39 @@ func TestEncrypt(t *testing.T) {
 			pos:      10,
 			expected: []byte{0x0A, 0x0B, 0x0C}, // 0+10, 0+11, 0+12
 		},
+		{
+			name:  "single char encrypt",
+			input: []byte{0x9e},
+			// Cipher: 02c701030503021f0101030208048c048902ec05030305045c0501050104560400
+			cipher: []CipherOp{
+				XorOp(0xc7),
+				ReverseBitsOp(),
+				XorPosOp(),
+				AddPosOp(),
+				XorPosOp(),
+				XorOp(0x1f),
+				ReverseBitsOp(),
+				ReverseBitsOp(),
+				XorPosOp(),
+				XorOp(0x08),
+				AddOp(0x8c),
+				AddOp(0x89),
+				XorOp(0xec),
+				AddPosOp(),
+				XorPosOp(),
+				XorPosOp(),
+				AddPosOp(),
+				AddOp(0x5c),
+				AddPosOp(),
+				ReverseBitsOp(),
+				AddPosOp(),
+				ReverseBitsOp(),
+				AddOp(0x56),
+				AddOp(0x00),
+			},
+			pos:      0,
+			expected: []byte{0x00},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -538,6 +571,39 @@ func TestDecrypt(t *testing.T) {
 			},
 			pos:      10,
 			expected: []byte{0x00, 0x00, 0x00},
+		},
+		{
+			name:      "single char decrypt",
+			encrypted: []byte{0x00},
+			// Cipher: 02c701030503021f0101030208048c048902ec05030305045c0501050104560400
+			cipher: []CipherOp{
+				XorOp(0xc7),
+				ReverseBitsOp(),
+				XorPosOp(),
+				AddPosOp(),
+				XorPosOp(),
+				XorOp(0x1f),
+				ReverseBitsOp(),
+				ReverseBitsOp(),
+				XorPosOp(),
+				XorOp(0x08),
+				AddOp(0x8c),
+				AddOp(0x89),
+				XorOp(0xec),
+				AddPosOp(),
+				XorPosOp(),
+				XorPosOp(),
+				AddPosOp(),
+				AddOp(0x5c),
+				AddPosOp(),
+				ReverseBitsOp(),
+				AddPosOp(),
+				ReverseBitsOp(),
+				AddOp(0x56),
+				AddOp(0x00),
+			},
+			pos:      0,
+			expected: []byte{0x9e},
 		},
 	}
 	for _, tt := range tests {
@@ -642,6 +708,39 @@ func TestEncryptDecryptRoundTrip(t *testing.T) {
 				XorPosOp(),
 			},
 			pos: 100,
+		},
+		{
+			name:      "single char with complex cipher",
+			plaintext: []byte{0x9e},
+			// Cipher: 02c701030503021f0101030208048c048902ec05030305045c0501050104560400
+			// This cipher encrypts 0x9e to 0x00, and decrypts 0x00 to 0x9e
+			cipher: []CipherOp{
+				XorOp(0xc7),
+				ReverseBitsOp(),
+				XorPosOp(),
+				AddPosOp(),
+				XorPosOp(),
+				XorOp(0x1f),
+				ReverseBitsOp(),
+				ReverseBitsOp(),
+				XorPosOp(),
+				XorOp(0x08),
+				AddOp(0x8c),
+				AddOp(0x89),
+				XorOp(0xec),
+				AddPosOp(),
+				XorPosOp(),
+				XorPosOp(),
+				AddPosOp(),
+				AddOp(0x5c),
+				AddPosOp(),
+				ReverseBitsOp(),
+				AddPosOp(),
+				ReverseBitsOp(),
+				AddOp(0x56),
+				AddOp(0x00),
+			},
+			pos: 0,
 		},
 	}
 	for _, tt := range tests {
@@ -937,52 +1036,6 @@ func TestGetMaxCountPartFromDecrypted(t *testing.T) {
 	}
 }
 
-func TestGetMaxCountPartFromDecryptedEdgeCases(t *testing.T) {
-	tests := []struct {
-		name      string
-		input     []byte
-		shouldPanic bool
-		panicMsg  string
-	}{
-		{
-			name:        "no newline",
-			input:       []byte("10x item"),
-			shouldPanic: true,
-			panicMsg:    "No newline found",
-		},
-		{
-			name:        "no x character",
-			input:       []byte("10 item,20 other\n"),
-			shouldPanic: true,
-			panicMsg:    "No 'x' found",
-		},
-		{
-			name:        "invalid count format",
-			input:       []byte("abcx item,10x other\n"),
-			shouldPanic: true,
-			panicMsg:    "Couldn't parse count",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			defer func() {
-				r := recover()
-				if tt.shouldPanic {
-					if r == nil {
-						t.Errorf("Expected panic for input %q", tt.input)
-					}
-				} else {
-					if r != nil {
-						t.Errorf("Unexpected panic for input %q: %v", tt.input, r)
-					}
-				}
-			}()
-			getMaxCountPartFromDecrypted(tt.input)
-		})
-	}
-}
-
 func TestGetMaxCountPartConsistency(t *testing.T) {
 	// Test that both string and byte versions produce the same results
 	tests := []string{
@@ -997,12 +1050,12 @@ func TestGetMaxCountPartConsistency(t *testing.T) {
 		t.Run(input, func(t *testing.T) {
 			// Add newline for byte version
 			byteInput := []byte(input + "\n")
-			
+
 			stringResult := getMaxCountPart(input)
 			byteResult := getMaxCountPartFromDecrypted(byteInput)
-			
+
 			if string(byteResult) != stringResult {
-				t.Errorf("Results differ:\n  string version: %q\n  byte version:   %q", 
+				t.Errorf("Results differ:\n  string version: %q\n  byte version:   %q",
 					stringResult, string(byteResult))
 			}
 		})

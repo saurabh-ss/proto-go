@@ -39,7 +39,7 @@ type CipherOp struct {
 	Arg byte // only used for OpXor and OpAdd
 }
 
-// Helper functions to create cipher operations
+// NoopOp Helper functions to create cipher operations
 func NoopOp() CipherOp {
 	return CipherOp{Op: OpNoop}
 }
@@ -199,8 +199,8 @@ func handleConnection(conn net.Conn) {
 		}
 
 		// Find the position of the ASCII newline character (0x0A) in the decrypted byte array
-		newlineIdx := bytes.IndexByte(decrypted, NewLine)
-		if newlineIdx == -1 {
+		found := bytes.Contains(decrypted, []byte{NewLine})
+		if !found {
 			panic("No newline found in decrypted message")
 		}
 
@@ -208,7 +208,7 @@ func handleConnection(conn net.Conn) {
 		result := getMaxCountPartFromDecrypted(decrypted)
 		log.Println("Part with max count: ", string(result))
 
-		encrypted := encrypt([]byte(result), cipher, responsePos)
+		encrypted := encrypt(result, cipher, responsePos)
 		responsePos += len(result) // Update response position counter
 
 		writer.Write(encrypted)
@@ -343,13 +343,13 @@ func getMaxCountPart(data string) string {
 
 func getMaxCountPartFromDecrypted(data []byte) []byte {
 	// Find the newline to get the complete line
-	newlineIdx := bytes.IndexByte(data, NewLine)
-	if newlineIdx == -1 {
+	before, _, ok := bytes.Cut(data, []byte{NewLine})
+	if !ok {
 		panic("No newline found in decrypted message")
 	}
 
 	// Work with the line up to the newline
-	line := data[:newlineIdx]
+	line := before
 
 	// Split by comma
 	var maxPart []byte
@@ -362,17 +362,19 @@ func getMaxCountPartFromDecrypted(data []byte) []byte {
 			part := line[start:i]
 
 			// Find 'x' in this part
-			xIdx := bytes.IndexByte(part, XChar)
-			if xIdx == -1 {
-				panic("No 'x' found in part: " + string(part))
+			before, _, ok := bytes.Cut(part, []byte{XChar})
+			if !ok {
+				log.Println("No 'x' found in part: " + string(part))
+				continue
 			}
 
 			// Parse the count (everything before 'x')
-			countStr := string(part[:xIdx])
+			countStr := string(before)
 			var count int
 			_, err := fmt.Sscanf(countStr, "%d", &count)
 			if err != nil {
-				panic("Couldn't parse count in part: " + string(part))
+				log.Println("Couldn't parse count in part: " + string(part))
+				continue
 			}
 
 			// Update max if this count is larger
