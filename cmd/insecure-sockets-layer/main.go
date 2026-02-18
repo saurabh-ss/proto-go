@@ -173,6 +173,8 @@ func handleConnection(conn net.Conn) {
 	requestPos := 0
 	responsePos := 0
 
+	remaining := []byte{} // Remaining data from the previous request
+
 	// Buffer. Clients won't send lines longer than 5000 characters.
 	buffer := make([]byte, 8192)
 	for {
@@ -191,28 +193,42 @@ func handleConnection(conn net.Conn) {
 		requestPos += n // Update request position counter
 
 		// decString := string(decrypted)
-		log.Println("Decrypted message:", decrypted)
+		log.Println("Decrypted message:", string(decrypted))
 
 		if bytes.Equal(decrypted, data) {
 			log.Println("Decrypted message is the same as the original message")
 			return
 		}
 
-		// Find the position of the ASCII newline character (0x0A) in the decrypted byte array
-		found := bytes.Contains(decrypted, []byte{NewLine})
-		if !found {
-			panic("No newline found in decrypted message")
+		remaining = append(remaining, decrypted...)
+
+		for {
+			idx := bytes.IndexByte(remaining, NewLine)
+			if idx == -1 {
+				break
+			}
+
+			line := remaining[:idx+1]
+			remaining = remaining[idx+1:]
+
+			result := getMaxCountPartFromDecrypted(line)
+			log.Println("Part with max count: ", string(result))
+
+			encrypted := encrypt(result, cipher, responsePos)
+			responsePos += len(result) // Update response position counter
+
+			writer.Write(encrypted)
+			writer.Flush()
 		}
 
-		// result := getMaxCountPart(decString)
-		result := getMaxCountPartFromDecrypted(decrypted)
-		log.Println("Part with max count: ", string(result))
+		// result := getMaxCountPartFromDecrypted(decrypted)
+		// log.Println("Part with max count: ", string(result))
 
-		encrypted := encrypt(result, cipher, responsePos)
-		responsePos += len(result) // Update response position counter
+		// encrypted := encrypt(result, cipher, responsePos)
+		// responsePos += len(result) // Update response position counter
 
-		writer.Write(encrypted)
-		writer.Flush()
+		// writer.Write(encrypted)
+		// writer.Flush()
 	}
 
 }
