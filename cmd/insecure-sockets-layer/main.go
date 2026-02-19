@@ -64,43 +64,62 @@ func AddPosOp() CipherOp {
 	return CipherOp{Op: OpAddPos}
 }
 
-// parseCipher converts a byte array into a slice of CipherOp
-func parseCipher(cipherBytes []byte) []CipherOp {
+// readCipher reads cipher ops from the stream byte-by-byte, consuming argument
+// bytes explicitly so that a 0x00 argument to Xor/Add does not terminate early.
+// The cipher spec ends at a 0x00 opcode (OpNoop used as terminator).
+func readCipher(r *bufio.Reader, clog *log.Logger) ([]CipherOp, error) {
 	var ops []CipherOp
-	i := 0
-	for i < len(cipherBytes) {
-		switch cipherBytes[i] {
+	var raw []byte
+	for {
+		opByte, err := r.ReadByte()
+		if err != nil {
+			return nil, err
+		}
+		raw = append(raw, opByte)
+		switch opByte {
 		case OpNoop:
-			ops = append(ops, NoopOp())
-			i++
+			// 0x00 is the end-of-cipher terminator
+			clog.Printf("Received cipher data (hex): %x\n", raw)
+			clog.Printf("Parsed cipher: %d operations\n", len(ops))
+			return ops, nil
 		case OpReverseBits:
 			ops = append(ops, ReverseBitsOp())
-			i++
-		case OpXor:
-			if i+1 < len(cipherBytes) {
-				ops = append(ops, XorOp(cipherBytes[i+1]))
-				i += 2
-			} else {
-				i++
-			}
 		case OpXorPos:
 			ops = append(ops, XorPosOp())
-			i++
-		case OpAdd:
-			if i+1 < len(cipherBytes) {
-				ops = append(ops, AddOp(cipherBytes[i+1]))
-				i += 2
-			} else {
-				i++
-			}
 		case OpAddPos:
 			ops = append(ops, AddPosOp())
-			i++
-		default:
-			i++
+		case OpXor:
+			arg, err := r.ReadByte()
+			if err != nil {
+				return nil, err
+			}
+			raw = append(raw, arg)
+			ops = append(ops, XorOp(arg))
+		case OpAdd:
+			arg, err := r.ReadByte()
+			if err != nil {
+				return nil, err
+			}
+			raw = append(raw, arg)
+			ops = append(ops, AddOp(arg))
 		}
 	}
-	return ops
+}
+
+// isCipherNoop returns true if the cipher has no observable effect on any byte
+// at any stream position. Position-dependent ops (XorPos, AddPos) use byte(pos),
+// which wraps every 256 bytes, so checking all 256 positions is exhaustive.
+func isCipherNoop(ops []CipherOp) bool {
+	for pos := range 256 {
+		for b := range 256 {
+			in := []byte{byte(b)}
+			out := encrypt(in, ops, pos)
+			if out[0] != in[0] {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func main() {
@@ -153,27 +172,32 @@ func main() {
 }
 
 func handleConnection(conn net.Conn) {
-	log.Println("New connection from", conn.RemoteAddr())
+	addr := conn.RemoteAddr().String()
+	clog := log.New(log.Writer(), fmt.Sprintf("[%s] ", addr), log.Flags())
+
+	clog.Println("New connection")
 	defer conn.Close()
 
 	reader := bufio.NewReader(conn)
 	writer := bufio.NewWriter(conn)
 
-	data, err := reader.ReadBytes(0x00)
+	cipher, err := readCipher(reader, clog)
 	if err != nil {
-		log.Println("Read error:", err)
+		clog.Println("Error reading cipher:", err)
 		return
 	}
-	log.Printf("Received cipher data (hex): %x\n", data)
+	clog.Printf("Parsed cipher: %d operations\n", len(cipher))
 
-	cipher := parseCipher(data)
-	log.Printf("Parsed cipher: %d operations\n", len(cipher))
+	if isCipherNoop(cipher) {
+		clog.Println("Cipher is a no-op, dropping connection")
+		return
+	}
 
 	// Initialize position counters for the connection
 	requestPos := 0
 	responsePos := 0
 
-	remaining := []byte{} // Remaining data from the previous request
+	remaining := []byte{}
 
 	// Buffer. Clients won't send lines longer than 5000 characters.
 	buffer := make([]byte, 8192)
@@ -183,22 +207,16 @@ func handleConnection(conn net.Conn) {
 			if err == io.EOF {
 				break
 			}
-			log.Println("Read error:", err)
+			clog.Println("Read error:", err)
 			return
 		}
-		data := buffer[:n]
-		log.Println("Received message:", data)
+		chunk := buffer[:n]
+		clog.Printf("Received %d bytes (hex): %x\n", n, chunk)
 
-		decrypted := decrypt(data, cipher, requestPos)
-		requestPos += n // Update request position counter
+		decrypted := decrypt(chunk, cipher, requestPos)
+		requestPos += n
 
-		// decString := string(decrypted)
-		log.Println("Decrypted message:", string(decrypted))
-
-		if bytes.Equal(decrypted, data) {
-			log.Println("Decrypted message is the same as the original message")
-			return
-		}
+		clog.Println("Decrypted:", string(decrypted))
 
 		remaining = append(remaining, decrypted...)
 
@@ -212,25 +230,15 @@ func handleConnection(conn net.Conn) {
 			remaining = remaining[idx+1:]
 
 			result := getMaxCountPartFromDecrypted(line)
-			log.Println("Part with max count: ", string(result))
+			clog.Println("Responding with:", string(result))
 
 			encrypted := encrypt(result, cipher, responsePos)
-			responsePos += len(result) // Update response position counter
+			responsePos += len(result)
 
 			writer.Write(encrypted)
 			writer.Flush()
 		}
-
-		// result := getMaxCountPartFromDecrypted(decrypted)
-		// log.Println("Part with max count: ", string(result))
-
-		// encrypted := encrypt(result, cipher, responsePos)
-		// responsePos += len(result) // Update response position counter
-
-		// writer.Write(encrypted)
-		// writer.Flush()
 	}
-
 }
 
 func decrypt(data []byte, cipher []CipherOp, pos int) []byte {

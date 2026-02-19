@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
+	"log"
 	"testing"
 )
 
@@ -894,19 +896,29 @@ func TestXorPosAcrossMultipleMessages(t *testing.T) {
 	}
 }
 
-func TestParseCipher(t *testing.T) {
+func readCipherFromBytes(t *testing.T, input []byte) []CipherOp {
+	t.Helper()
+	clog := log.New(log.Writer(), "[test] ", log.Flags())
+	r := bufio.NewReader(bytes.NewReader(input))
+	ops, err := readCipher(r, clog)
+	if err != nil {
+		t.Fatalf("readCipher error: %v", err)
+	}
+	return ops
+}
+
+func TestReadCipher(t *testing.T) {
 	tests := []struct {
 		name     string
 		input    []byte
 		expected []CipherOp
 	}{
 		{
-			name:  "mixed operations",
+			name:  "xor then reversebits terminated by 0x00",
 			input: []byte{0x02, 0x01, 0x01, 0x00},
 			expected: []CipherOp{
 				XorOp(0x01),
 				ReverseBitsOp(),
-				NoopOp(),
 			},
 		},
 		{
@@ -915,7 +927,6 @@ func TestParseCipher(t *testing.T) {
 			expected: []CipherOp{
 				AddPosOp(),
 				AddPosOp(),
-				NoopOp(),
 			},
 		},
 		{
@@ -925,14 +936,12 @@ func TestParseCipher(t *testing.T) {
 				XorOp(0xa0),
 				XorOp(0x0b),
 				XorOp(0xab),
-				NoopOp(),
 			},
 		},
 		{
 			name:  "all operation types",
-			input: []byte{0x00, 0x01, 0x02, 0xFF, 0x03, 0x04, 0x10, 0x05},
+			input: []byte{0x01, 0x02, 0xFF, 0x03, 0x04, 0x10, 0x05, 0x00},
 			expected: []CipherOp{
-				NoopOp(),
 				ReverseBitsOp(),
 				XorOp(0xFF),
 				XorPosOp(),
@@ -940,19 +949,126 @@ func TestParseCipher(t *testing.T) {
 				AddPosOp(),
 			},
 		},
+		{
+			// 0x00 as argument to Add must not terminate the cipher early
+			name:  "add with 0x00 argument is not a terminator",
+			input: []byte{0x04, 0x00, 0x01, 0x00},
+			expected: []CipherOp{
+				AddOp(0x00),
+				ReverseBitsOp(),
+			},
+		},
+		{
+			// 0x00 as argument to Xor must not terminate the cipher early
+			name:  "xor with 0x00 argument is not a terminator",
+			input: []byte{0x02, 0x00, 0x05, 0x00},
+			expected: []CipherOp{
+				XorOp(0x00),
+				AddPosOp(),
+			},
+		},
+		{
+			// Reproduces the real-world bug: cipher ends with Add(0xe2), Add(0x00)
+			// followed by the actual 0x00 terminator
+			name:  "add(0x00) before terminator (real-world bug case)",
+			input: []byte{0x04, 0xe2, 0x04, 0x00, 0x00},
+			expected: []CipherOp{
+				AddOp(0xe2),
+				AddOp(0x00),
+			},
+		},
+		{
+			name:     "empty cipher (just terminator)",
+			input:    []byte{0x00},
+			expected: []CipherOp{},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := parseCipher(tt.input)
+			result := readCipherFromBytes(t, tt.input)
 			if len(result) != len(tt.expected) {
-				t.Errorf("parseCipher(%v) returned %d ops, want %d", tt.input, len(result), len(tt.expected))
+				t.Errorf("readCipher(%x) returned %d ops, want %d: got %v, want %v",
+					tt.input, len(result), len(tt.expected), result, tt.expected)
 				return
 			}
 			for i := range result {
 				if result[i].Op != tt.expected[i].Op || result[i].Arg != tt.expected[i].Arg {
-					t.Errorf("parseCipher(%v)[%d] = {Op: %x, Arg: %x}, want {Op: %x, Arg: %x}",
+					t.Errorf("readCipher(%x)[%d] = {Op: %x, Arg: %x}, want {Op: %x, Arg: %x}",
 						tt.input, i, result[i].Op, result[i].Arg, tt.expected[i].Op, tt.expected[i].Arg)
 				}
+			}
+		})
+	}
+}
+
+func TestIsCipherNoop(t *testing.T) {
+	tests := []struct {
+		name     string
+		ops      []CipherOp
+		expected bool
+	}{
+		{
+			name:     "empty cipher is noop",
+			ops:      []CipherOp{},
+			expected: true,
+		},
+		{
+			name:     "explicit noop op",
+			ops:      []CipherOp{NoopOp()},
+			expected: true,
+		},
+		{
+			name:     "xor with zero is noop",
+			ops:      []CipherOp{XorOp(0x00)},
+			expected: true,
+		},
+		{
+			name:     "add with zero is noop",
+			ops:      []CipherOp{AddOp(0x00)},
+			expected: true,
+		},
+		{
+			name:     "xor cancels itself",
+			ops:      []CipherOp{XorOp(0xAB), XorOp(0xAB)},
+			expected: true,
+		},
+		{
+			name:     "reversebits cancels itself",
+			ops:      []CipherOp{ReverseBitsOp(), ReverseBitsOp()},
+			expected: true,
+		},
+		{
+			name:     "xorpos does not cancel itself (position 1 changes)",
+			ops:      []CipherOp{XorPosOp()},
+			expected: false,
+		},
+		{
+			name:     "xor with non-zero is not noop",
+			ops:      []CipherOp{XorOp(0x01)},
+			expected: false,
+		},
+		{
+			name:     "add with non-zero is not noop",
+			ops:      []CipherOp{AddOp(0x01)},
+			expected: false,
+		},
+		{
+			name:     "reversebits alone is not noop",
+			ops:      []CipherOp{ReverseBitsOp()},
+			expected: false,
+		},
+		{
+			// xorPos followed by xorPos cancels at every position since x^p^p == x
+			name:     "xorpos cancels itself",
+			ops:      []CipherOp{XorPosOp(), XorPosOp()},
+			expected: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := isCipherNoop(tt.ops)
+			if result != tt.expected {
+				t.Errorf("isCipherNoop(%v) = %v, want %v", tt.ops, result, tt.expected)
 			}
 		})
 	}
