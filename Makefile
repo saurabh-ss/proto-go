@@ -1,4 +1,4 @@
-.PHONY: all build build-darwin build-linux build-all clean run test fmt vet lint help
+.PHONY: all build build-darwin build-linux build-all clean run test fmt vet lint help profile-cpu profile-mem profile-goroutine flamegraph
 
 # Binary output directory
 BIN_DIR := bin
@@ -71,6 +71,28 @@ vet: ## Run go vet
 	$(GOVET) ./...
 
 lint: fmt vet ## Run formatters and linters
+
+# Profiling targets (requires job-center to be running with pprof on localhost:6060)
+# Override defaults: make profile-cpu PPROF_DURATION=60s PPROF_UI_PORT=9090
+PPROF_HOST     := localhost:6060
+PPROF_DURATION := 30s
+PPROF_UI_PORT  := 8080
+PPROF_DIR      := profiles
+
+profile-cpu: ## Fetch a CPU profile and open flame graph UI (override: PPROF_DURATION=Ns, PPROF_UI_PORT=N)
+	@mkdir -p $(PPROF_DIR)
+	@echo "Sampling CPU for $(PPROF_DURATION) then opening http://localhost:$(PPROF_UI_PORT) ..."
+	go tool pprof -http=:$(PPROF_UI_PORT) "http://$(PPROF_HOST)/debug/pprof/profile?seconds=$(shell echo '$(PPROF_DURATION)' | tr -d 's')"
+
+profile-mem: ## Fetch a heap profile and open flame graph UI (override: PPROF_UI_PORT=N)
+	@echo "Fetching heap profile then opening http://localhost:$(PPROF_UI_PORT) ..."
+	go tool pprof -http=:$(PPROF_UI_PORT) "http://$(PPROF_HOST)/debug/pprof/heap"
+
+profile-goroutine: ## Fetch a goroutine profile and open flame graph UI (override: PPROF_UI_PORT=N)
+	@echo "Fetching goroutine profile then opening http://localhost:$(PPROF_UI_PORT) ..."
+	go tool pprof -http=:$(PPROF_UI_PORT) "http://$(PPROF_HOST)/debug/pprof/goroutine"
+
+flamegraph: profile-cpu ## Alias for profile-cpu
 
 help: ## Show this help message
 	@echo "Available targets:"

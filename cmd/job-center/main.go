@@ -11,6 +11,8 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"sync"
@@ -215,6 +217,11 @@ func (js *JobServer) Delete(id uint64, conn net.Conn) error {
 var port = flag.String("port", "50001", "Port to listen on")
 
 func main() {
+	go func() {
+		log.Println("Pprof server starting on :6060")
+		log.Fatal(http.ListenAndServe("localhost:6060", nil))
+	}()
+
 	flag.Parse()
 
 	// Setup logging to logs directory

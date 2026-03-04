@@ -47,6 +47,21 @@ go run ./cmd/smoke
 go run ./cmd/prime
 ```
 
+## Profiling (job-center)
+
+The `job-center` server exposes a [pprof](https://pkg.go.dev/net/http/pprof) HTTP endpoint on `localhost:6060` for live profiling.
+
+**Prerequisites:** the server must be running and receiving load from an external source.
+
+```bash
+make profile-cpu              # sample CPU for 30s, then open flame graph UI
+make profile-cpu PPROF_DURATION=60s   # longer sample
+make profile-mem              # heap snapshot
+make profile-goroutine        # goroutine dump
+```
+
+All targets open an interactive browser UI at `http://localhost:8080`. Use the **Flame Graph** view in the top nav to visualize hot paths. Override the UI port with `PPROF_UI_PORT=9090` if needed.
+
 ## Logging
 
 All applications automatically log to timestamped files in the `logs/` directory. Logs are written to both the console (stdout) and log files for easy debugging. Each application creates its own log file with the format:
